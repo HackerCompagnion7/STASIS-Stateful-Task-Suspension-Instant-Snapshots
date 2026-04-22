@@ -22,6 +22,8 @@ type FnPthreadCreate = unsafe extern "C" fn(
     extern "C" fn(*mut c_void) -> *mut c_void,
     *mut c_void,
 ) -> i32;
+type FnSigaction = unsafe extern "C" fn(i32, *const c_void, *mut c_void) -> i32;
+type FnSignal = unsafe extern "C" fn(i32, *const c_void) -> *const c_void;
 
 // ============================================================================
 // Estado global
@@ -29,6 +31,8 @@ type FnPthreadCreate = unsafe extern "C" fn(
 
 static mut REAL_WRITE: Option<FnWrite> = None;
 static mut REAL_PTHREAD_CREATE: Option<FnPthreadCreate> = None;
+static mut REAL_SIGACTION: Option<FnSigaction> = None;
+static mut REAL_SIGNAL: Option<FnSignal> = None;
 static mut IN_HOOK: bool = false;
 
 // Thread tracking
@@ -39,8 +43,11 @@ static mut THREAD_TIDS: [i32; MAX_THREADS] = [0; MAX_THREADS];
 static mut THREAD_COUNT: usize = 0;
 static mut STASIS_PID: i32 = 0;
 
+// Flag: handlers instalados y listos
+static mut HANDLERS_INSTALLED: bool = false;
+
 // ============================================================================
-// raw_syscall_write - Naked, ya funciona en ambas arquitecturas
+// raw_syscall_write - Naked, funciona en ambas arquitecturas
 // ============================================================================
 
 #[cfg(target_arch = "x86_64")]
@@ -192,7 +199,6 @@ unsafe fn syscall4(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64) -> i64 {
 // getpid:    x86_64=39,  aarch64=172
 // tgkill:    x86_64=234, aarch64=131
 // nanosleep: x86_64=35,  aarch64=101
-// rt_sigaction: x86_64=13, aarch64=134
 // ============================================================================
 
 #[cfg(target_arch = "x86_64")]
@@ -236,19 +242,16 @@ unsafe fn raw_nanosleep() -> i32 {
 // Signal handler installation via libc sigaction()
 // ============================================================================
 //
-// PROBLEMA ORIGINAL: Usabamos un struct GlibcSigaction con sa_mask de 128 bytes
-// (layout glibc). En Bionic, sa_mask es solo 8 bytes → offsets equivocados
-// → sigaction() lee basura → handler NO se instala.
-//
-// SOLUCION: Usar el struct correcto para cada libc via #[cfg(target_env)]:
-//   - glibc (Linux desktop):  sigset_t = 128 bytes (16 × u64)
-//   - Bionic (Android/Termux): sigset_t = 8 bytes (1 × u64)
-//
-// El handler mismo solo usa raw syscalls (zero libc). Pero para INSTALAR
-// el handler, usamos libc's sigaction() porque:
+// Usamos libc's sigaction() para instalar handlers porque:
 //   1. Maneja sa_restorer automaticamente (requerido en x86_64)
 //   2. Traduce el layout interno correctamente
-//   3. Funciona en glibc, Bionic, musl
+//
+// PERo HOOKEamos sigaction() y signal() para que NADIE pueda
+// sobrescribir nuestros handlers de SIGUSR1/SIGUSR2.
+//
+// Layout por libc:
+//   - glibc:  sa_mask = 128 bytes (16 × u64)
+//   - Bionic: sa_mask = 8 bytes   (1 × u64)
 // ============================================================================
 
 // glibc sigaction layout
@@ -256,29 +259,29 @@ unsafe fn raw_nanosleep() -> i32 {
 #[repr(C)]
 struct LibcSigaction {
     sa_handler: *const c_void,
-    sa_mask: [u64; 16], // glibc sigset_t = 128 bytes
+    sa_mask: [u64; 16],
     sa_flags: i32,
     _pad: i32,
     sa_restorer: *const c_void,
 }
 
-// Bionic sigaction layout (aarch64 Android/Termux)
+// Bionic sigaction layout
 #[cfg(target_arch = "aarch64")]
 #[repr(C)]
 struct LibcSigaction {
     sa_handler: *const c_void,
-    sa_mask: [u64; 1],  // Bionic sigset_t = 8 bytes (unsigned long)
+    sa_mask: [u64; 1],
     sa_flags: i32,
     _pad: i32,
     sa_restorer: *const c_void,
 }
 
-// Fallback para otros entornos (musl, etc)
+// Fallback
 #[cfg(all(not(all(target_arch = "x86_64", target_env = "gnu")), not(target_arch = "aarch64")))]
 #[repr(C)]
 struct LibcSigaction {
     sa_handler: *const c_void,
-    sa_mask: [u64; 16], // default: asumir glibc-size
+    sa_mask: [u64; 16],
     sa_flags: i32,
     _pad: i32,
     sa_restorer: *const c_void,
@@ -286,10 +289,7 @@ struct LibcSigaction {
 
 const SA_RESTART: i32 = 0x10000000;
 
-extern "C" {
-    fn sigaction(sig: i32, act: *const LibcSigaction, oldact: *mut LibcSigaction) -> i32;
-}
-
+// Instalar signal handler via REAL_SIGACTION (bypass nuestro hook)
 #[cfg(all(target_arch = "x86_64", target_env = "gnu"))]
 unsafe fn install_signal_handler(sig: i32, handler: *const c_void) -> i32 {
     let act = LibcSigaction {
@@ -299,7 +299,13 @@ unsafe fn install_signal_handler(sig: i32, handler: *const c_void) -> i32 {
         _pad: 0,
         sa_restorer: core::ptr::null(),
     };
-    sigaction(sig, &act, core::ptr::null_mut())
+    match REAL_SIGACTION {
+        Some(func) => func(sig, &act as *const _ as *const c_void, core::ptr::null_mut()),
+        None => {
+            log_raw(b"[STASIS FATAL] REAL_SIGACTION no disponible\n");
+            -1
+        }
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -311,7 +317,13 @@ unsafe fn install_signal_handler(sig: i32, handler: *const c_void) -> i32 {
         _pad: 0,
         sa_restorer: core::ptr::null(),
     };
-    sigaction(sig, &act, core::ptr::null_mut())
+    match REAL_SIGACTION {
+        Some(func) => func(sig, &act as *const _ as *const c_void, core::ptr::null_mut()),
+        None => {
+            log_raw(b"[STASIS FATAL] REAL_SIGACTION no disponible\n");
+            -1
+        }
+    }
 }
 
 #[cfg(all(not(all(target_arch = "x86_64", target_env = "gnu")), not(target_arch = "aarch64")))]
@@ -323,7 +335,28 @@ unsafe fn install_signal_handler(sig: i32, handler: *const c_void) -> i32 {
         _pad: 0,
         sa_restorer: core::ptr::null(),
     };
-    sigaction(sig, &act, core::ptr::null_mut())
+    match REAL_SIGACTION {
+        Some(func) => func(sig, &act as *const _ as *const c_void, core::ptr::null_mut()),
+        None => -1,
+    }
+}
+
+// Verificar que nuestro handler sigue instalado
+unsafe fn verify_handler(sig: i32, expected: *const c_void) -> bool {
+    let mut old_act: LibcSigaction = core::mem::zeroed();
+    match REAL_SIGACTION {
+        Some(func) => {
+            func(sig, core::ptr::null(), &mut old_act as *mut _ as *mut c_void);
+            old_act.sa_handler == expected
+        }
+        None => false,
+    }
+}
+
+// Reinstalar ambos handlers (usado como respaldo)
+unsafe fn reinstall_handlers() {
+    install_signal_handler(SIGUSR2, stasis_freeze_handler as *const c_void);
+    install_signal_handler(SIGUSR1, stasis_freeze_trigger as *const c_void);
 }
 
 // ============================================================================
@@ -335,7 +368,7 @@ unsafe fn log_raw(msg: &[u8]) {
 }
 
 // ============================================================================
-// Importar funciones de libc (solo dlsym, nada de signal)
+// Importar funciones de libc
 // ============================================================================
 
 extern "C" {
@@ -352,11 +385,8 @@ extern "C" {
 // ============================================================================
 
 // SIGUSR2 (señal 12): congela ESTE thread
-// Cada thread que recibe SIGUSR2 entra en un loop de nanosleep.
-// CPU cae a casi 0. Thread congelado.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn stasis_freeze_handler(sig: i32) {
-    // Log signal number para debugging
     if sig == SIGUSR2 {
         log_raw(b"[STASIS FREEZE] SIGUSR2 - Thread congelado\n");
     } else {
@@ -373,21 +403,14 @@ unsafe extern "C" fn stasis_freeze_handler(sig: i32) {
 unsafe extern "C" fn stasis_freeze_trigger(_: i32) {
     log_raw(b"[STASIS] >>> FREEZE GLOBAL INICIADO <<<\n");
 
-    // Enviar SIGUSR2 a todos los TIDs registrados
     let count = THREAD_COUNT;
     let pid = STASIS_PID;
 
-    // Log cuántos threads estamos congelando
     if count == 0 {
         log_raw(b"[STASIS WARN] No hay threads registrados\n");
-    } else if count == 1 {
-        log_raw(b"[STASIS] Congelando 1 thread\n");
-    } else if count == 2 {
-        log_raw(b"[STASIS] Congelando 2 threads\n");
-    } else if count == 3 {
-        log_raw(b"[STASIS] Congelando 3 threads\n");
-    } else if count == 4 {
-        log_raw(b"[STASIS] Congelando 4 threads\n");
+    } else if count <= 4 {
+        // Log simple para counts comunes
+        log_raw(b"[STASIS] Congelando threads\n");
     } else {
         log_raw(b"[STASIS] Congelando N threads\n");
     }
@@ -395,7 +418,6 @@ unsafe extern "C" fn stasis_freeze_trigger(_: i32) {
     for i in 0..count {
         let tid = THREAD_TIDS[i];
         if tid > 0 && tid != raw_gettid() {
-            // No enviar señal al thread actual, se congela al final
             let ret = raw_tgkill(pid, tid, SIGUSR2);
             if ret != 0 {
                 log_raw(b"[STASIS WARN] tgkill fallo\n");
@@ -462,7 +484,24 @@ pub unsafe extern "C" fn stasis_init() {
     THREAD_TIDS[0] = main_tid;
     THREAD_COUNT = 1;
 
-    // Resolver write() original
+    // Resolver funciones originales via dlsym
+    // IMPORTANTE: resolver sigaction ANTES de instalar handlers,
+    // porque nuestro hook de sigaction necesita REAL_SIGACTION
+
+    let real_sigaction_ptr = dlsym(RTLD_NEXT, b"sigaction\0".as_ptr());
+    if real_sigaction_ptr.is_null() {
+        log_raw(b"[STASIS FATAL] dlsym(sigaction) failed\n");
+        return;
+    }
+    REAL_SIGACTION = Some(core::mem::transmute(real_sigaction_ptr));
+
+    let real_signal_ptr = dlsym(RTLD_NEXT, b"signal\0".as_ptr());
+    if real_signal_ptr.is_null() {
+        log_raw(b"[STASIS WARN] dlsym(signal) failed\n");
+    } else {
+        REAL_SIGNAL = Some(core::mem::transmute(real_signal_ptr));
+    }
+
     let real_write_ptr = dlsym(RTLD_NEXT, b"write\0".as_ptr());
     if real_write_ptr.is_null() {
         log_raw(b"[STASIS FATAL] dlsym(write) failed\n");
@@ -470,7 +509,6 @@ pub unsafe extern "C" fn stasis_init() {
     }
     REAL_WRITE = Some(core::mem::transmute(real_write_ptr));
 
-    // Resolver pthread_create() original
     let real_pthread_ptr = dlsym(RTLD_NEXT, b"pthread_create\0".as_ptr());
     if real_pthread_ptr.is_null() {
         log_raw(b"[STASIS WARN] dlsym(pthread_create) failed\n");
@@ -478,10 +516,7 @@ pub unsafe extern "C" fn stasis_init() {
         REAL_PTHREAD_CREATE = Some(core::mem::transmute(real_pthread_ptr));
     }
 
-    // Instalar signal handlers via libc sigaction()
-    // (struct correcto por arquitectura: glibc=128bytes, Bionic=8bytes)
-    //
-    // SIGUSR2 (senal 12): congela el thread que lo recibe
+    // Instalar signal handlers via REAL sigaction (bypass nuestro hook)
     let ret2 = install_signal_handler(SIGUSR2, stasis_freeze_handler as *const c_void);
     if ret2 != 0 {
         log_raw(b"[STASIS FATAL] sigaction(SIGUSR2) fallo\n");
@@ -489,7 +524,6 @@ pub unsafe extern "C" fn stasis_init() {
         log_raw(b"[STASIS] Handler SIGUSR2 instalado OK\n");
     }
 
-    // SIGUSR1 (senal 10): broadcast SIGUSR2 a todos los threads (freeze global)
     let ret1 = install_signal_handler(SIGUSR1, stasis_freeze_trigger as *const c_void);
     if ret1 != 0 {
         log_raw(b"[STASIS FATAL] sigaction(SIGUSR1) fallo\n");
@@ -497,17 +531,21 @@ pub unsafe extern "C" fn stasis_init() {
         log_raw(b"[STASIS] Handler SIGUSR1 instalado OK\n");
     }
 
-    // Verificar que el handler SIGUSR1 quedó instalado correctamente
-    // (leer de vuelta con sigaction(oldact) y comparar punteros)
-    let mut old_act: LibcSigaction = core::mem::zeroed();
-    sigaction(SIGUSR1, core::ptr::null(), &mut old_act);
-    if old_act.sa_handler == stasis_freeze_trigger as *const c_void {
+    // Verificar que los handlers quedaron instalados correctamente
+    if verify_handler(SIGUSR1, stasis_freeze_trigger as *const c_void) {
         log_raw(b"[STASIS] SIGUSR1 handler verificado OK\n");
-    } else if old_act.sa_handler.is_null() {
-        log_raw(b"[STASIS FATAL] SIGUSR1 handler es NULL!\n");
     } else {
-        log_raw(b"[STASIS FATAL] SIGUSR1 handler no coincide!\n");
+        log_raw(b"[STASIS FATAL] SIGUSR1 handler no coincide - reintentando\n");
+        // Segundo intento
+        install_signal_handler(SIGUSR1, stasis_freeze_trigger as *const c_void);
+        if verify_handler(SIGUSR1, stasis_freeze_trigger as *const c_void) {
+            log_raw(b"[STASIS] SIGUSR1 handler reinstalado OK\n");
+        } else {
+            log_raw(b"[STASIS FATAL] SIGUSR1 handler IMPOSIBLE de instalar\n");
+        }
     }
+
+    HANDLERS_INSTALLED = true;
 
     log_raw(b"[STASIS] Hook activo. kill -10 <pid> = freeze all\n");
 }
@@ -535,7 +573,7 @@ pub unsafe extern "C" fn write(fd: i32, buf: *const c_void, count: usize) -> isi
 }
 
 // ============================================================================
-// Hook: pthread_create - Registra threads + captura TIDs
+// Hook: pthread_create - Registra threads + captura TIDs + reinstala handlers
 // ============================================================================
 
 #[no_mangle]
@@ -567,8 +605,8 @@ pub unsafe extern "C" fn pthread_create(
     SLOT_ARGS[slot_idx] = arg;
     SLOT_ACTIVE[slot_idx] = true;
 
-    // Llamar pthread_create REAL con nuestro wrapper y slot_idx como arg
-    match REAL_PTHREAD_CREATE {
+    // Llamar pthread_create REAL con nuestro wrapper
+    let result = match REAL_PTHREAD_CREATE {
         Some(func) => func(
             thread,
             attr,
@@ -580,6 +618,91 @@ pub unsafe extern "C" fn pthread_create(
             log_raw(b"[STASIS FATAL] pthread_create real no disponible\n");
             -1
         }
+    };
+
+    // RESPALDO: Reinstalar handlers despues de cada pthread_create
+    // En Bionic/Android, pthread_create puede sobrescribir signal handlers
+    if HANDLERS_INSTALLED {
+        reinstall_handlers();
+    }
+
+    result
+}
+
+// ============================================================================
+// Hook: sigaction - Protege SIGUSR1 y SIGUSR2 contra sobrescritura
+// ============================================================================
+//
+// Si alguien intenta cambiar el handler de SIGUSR1 o SIGUSR2,
+// retornamos éxito (0) pero NO hacemos el cambio realmente.
+// Si piden oldact, les damos el handler real que está instalado.
+// Para otras señales, pasamos al sigaction real normalmente.
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "C" fn sigaction(
+    sig: i32,
+    act: *const c_void,
+    oldact: *mut c_void,
+) -> i32 {
+    // Proteger nuestras señales
+    if sig == SIGUSR1 || sig == SIGUSR2 {
+        // Si piden el oldact, darles nuestro handler real
+        if !oldact.is_null() {
+            match REAL_SIGACTION {
+                Some(func) => {
+                    func(sig, core::ptr::null(), oldact);
+                }
+                None => {}
+            }
+        }
+        // Si hay act (intentan instalar un handler), lo ignoramos
+        // Retornamos 0 (éxito) para que el llamador no se queje
+        if !act.is_null() {
+            log_raw(b"[STASIS GUARD] sigaction blocked on protected signal\n");
+        }
+        return 0;
+    }
+
+    // Para otras señales, pasar al sigaction real
+    match REAL_SIGACTION {
+        Some(func) => func(sig, act, oldact),
+        None => -1,
+    }
+}
+
+// ============================================================================
+// Hook: signal - Protege SIGUSR1 y SIGUSR2 contra sobrescritura
+// ============================================================================
+//
+// Igual que sigaction: si alguien intenta signal(SIGUSR1, ...) o
+// signal(SIGUSR2, ...), retornamos el handler anterior pero NO cambiamos nada.
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "C" fn signal(
+    sig: i32,
+    handler: *const c_void,
+) -> *const c_void {
+    // Proteger nuestras señales
+    if sig == SIGUSR1 || sig == SIGUSR2 {
+        // Retornar el handler que está realmente instalado
+        // (para que el llamador crea que todo está bien)
+        let mut old_act: LibcSigaction = core::mem::zeroed();
+        match REAL_SIGACTION {
+            Some(func) => {
+                func(sig, core::ptr::null(), &mut old_act as *mut _ as *mut c_void);
+            }
+            None => {}
+        }
+        log_raw(b"[STASIS GUARD] signal() blocked on protected signal\n");
+        return old_act.sa_handler;
+    }
+
+    // Para otras señales, pasar al signal real
+    match REAL_SIGNAL {
+        Some(func) => func(sig, handler),
+        None => core::ptr::null(),
     }
 }
 
