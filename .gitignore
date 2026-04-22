@@ -3,4 +3,6 @@
 *.so
 *.d
 test_bin
+test_freeze_bin
+*_bin
 Cargo.lock

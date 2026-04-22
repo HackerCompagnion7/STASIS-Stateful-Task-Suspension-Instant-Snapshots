@@ -112,6 +112,7 @@ unsafe fn syscall3(nr: i64, a1: i64, a2: i64, a3: i64) -> i64 {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
 unsafe fn syscall4(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64) -> i64 {
     let ret: i64;
     core::arch::asm!(
@@ -168,6 +169,7 @@ unsafe fn syscall3(nr: i64, a1: i64, a2: i64, a3: i64) -> i64 {
 }
 
 #[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
 unsafe fn syscall4(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64) -> i64 {
     let ret: i64;
     core::arch::asm!(
