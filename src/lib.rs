@@ -5,11 +5,25 @@ use core::ffi::c_void;
 // Definimos la constante de RTLD_NEXT de glibc/Bionic
 const RTLD_NEXT: *const c_void = -1isize as *const c_void;
 
-// Estructura para mapear la firma de la función write de C
+// ============================================================================
+// Tipos de función para los hooks
+// ============================================================================
+
 type FnWrite = unsafe extern "C" fn(i32, *const c_void, usize) -> isize;
 
-// Variable global estática para guardar el puntero a la función real
+type FnPthreadCreate = unsafe extern "C" fn(
+    *mut c_void,                          // thread (pthread_t*)
+    *const c_void,                        // attr (pthread_attr_t*)
+    extern "C" fn(*mut c_void) -> *mut c_void, // start_routine
+    *mut c_void,                          // arg
+) -> i32;
+
+// ============================================================================
+// Variables globales estáticas para guardar punteros a funciones reales
+// ============================================================================
+
 static mut REAL_WRITE: Option<FnWrite> = None;
+static mut REAL_PTHREAD_CREATE: Option<FnPthreadCreate> = None;
 
 // Flag atómico para prevenir recursión durante la inicialización
 static mut IN_HOOK: bool = false;
@@ -45,7 +59,16 @@ unsafe extern "C" fn raw_syscall_write(fd: i32, buf: *const u8, len: usize) -> i
     )
 }
 
+// ============================================================================
+// Helper: escribir string estático a stderr via syscall directa
+// ============================================================================
+unsafe fn log_raw(msg: &[u8]) {
+    raw_syscall_write(2, msg.as_ptr(), msg.len());
+}
+
+// ============================================================================
 // Importar dlsym desde libdl - funciona tanto en glibc como en Bionic
+// ============================================================================
 extern "C" {
     fn dlsym(handle: *const c_void, symbol: *const u8) -> *const c_void;
 }
@@ -55,19 +78,23 @@ extern "C" {
 // ============================================================================
 #[no_mangle]
 pub unsafe extern "C" fn stasis_init() {
-    // Buscamos la dirección de la función 'write' original en glibc/Bionic
+    // Resolver write() original
     let real_write_ptr = dlsym(RTLD_NEXT, b"write\0".as_ptr());
-
     if real_write_ptr.is_null() {
-        let err = b"[STASIS FATAL] dlsym failed\n";
-        raw_syscall_write(2, err.as_ptr(), err.len());
+        log_raw(b"[STASIS FATAL] dlsym(write) failed\n");
         return;
     }
-
     REAL_WRITE = Some(core::mem::transmute::<*const c_void, FnWrite>(real_write_ptr));
 
-    let msg = b"[STASIS] Hook activo. Interceptando write()\n";
-    raw_syscall_write(2, msg.as_ptr(), msg.len());
+    // Resolver pthread_create() original
+    let real_pthread_ptr = dlsym(RTLD_NEXT, b"pthread_create\0".as_ptr());
+    if real_pthread_ptr.is_null() {
+        log_raw(b"[STASIS WARN] dlsym(pthread_create) failed\n");
+    } else {
+        REAL_PTHREAD_CREATE = Some(core::mem::transmute::<*const c_void, FnPthreadCreate>(real_pthread_ptr));
+    }
+
+    log_raw(b"[STASIS] Hook activo. Interceptando write() + pthread_create()\n");
 }
 
 // Atributo para asegurar que el linker llame a nuestro init antes de main()
@@ -83,8 +110,7 @@ pub unsafe extern "C" fn write(fd: i32, buf: *const c_void, count: usize) -> isi
     // Solo interceptamos stdout (fd 1) para no causar tormentas de logs
     if fd == 1 && !IN_HOOK {
         IN_HOOK = true;
-        let msg = b"[STASIS HOOK] Capturado write en stdout\n";
-        raw_syscall_write(2, msg.as_ptr(), msg.len());
+        log_raw(b"[STASIS HOOK] Capturado write en stdout\n");
         IN_HOOK = false;
     }
 
@@ -95,10 +121,41 @@ pub unsafe extern "C" fn write(fd: i32, buf: *const c_void, count: usize) -> isi
     }
 }
 
+// ============================================================================
+// Hook de pthread_create - Registra todos los threads del proceso
+// ============================================================================
+//
+// Este es el hook que define si STASIS vive o muere.
+// Si podemos interceptar la creación de threads:
+//   - Podemos ver TODOS los threads del proceso
+//   - Podemos enviar señales a todos
+//   - Podemos coordinar "stop-the-world"
+//
+#[no_mangle]
+pub unsafe extern "C" fn pthread_create(
+    thread: *mut c_void,
+    attr: *const c_void,
+    start_routine: extern "C" fn(*mut c_void) -> *mut c_void,
+    arg: *mut c_void,
+) -> i32 {
+    // Log via syscall directa - cero riesgo de recursión
+    log_raw(b"[STASIS] pthread_create interceptado\n");
+
+    // Passthrough a la función real de glibc/Bionic
+    match REAL_PTHREAD_CREATE {
+        Some(func) => func(thread, attr, start_routine, arg),
+        None => {
+            log_raw(b"[STASIS FATAL] pthread_create real no disponible\n");
+            -1
+        }
+    }
+}
+
+// ============================================================================
 // Panic handler mínimo para no depender de std
+// ============================================================================
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    let msg = b"[STASIS PANIC]\n";
-    unsafe { raw_syscall_write(2, msg.as_ptr(), msg.len()) };
+    unsafe { log_raw(b"[STASIS PANIC]\n") };
     loop {}
 }
