@@ -1,10 +1,9 @@
 /*
- * test_guard.c - Verifica que los hooks de sigaction/signal protegen SIGUSR1
+ * test_guard.c - Verifica que los hooks protegen SIGUSR2
  *
- * El programa intenta sobrescribir el handler de SIGUSR1 con signal().
- * Nuestro hook deberia bloquear el cambio.
- * Luego envía SIGUSR1 a si mismo — si el handler funciona, imprime
- * [STASIS] >>> FREEZE GLOBAL INICIADO <<< y se congela.
+ * El programa intenta sobrescribir el handler de SIGUSR2 con signal()
+ * y sigaction(). Nuestro hook deberia bloquear el cambio.
+ * Luego envia SIGUSR2 a si mismo - si funciona, se congela.
  */
 
 #include <stdio.h>
@@ -17,12 +16,12 @@ void dummy_handler(int sig) {
 }
 
 int main() {
-    printf("Intentando sobrescribir SIGUSR1 handler...\n");
+    printf("Intentando sobrescribir SIGUSR2 handler...\n");
     fflush(stdout);
 
     // Intentar sobrescribir con signal()
-    void *old = signal(10, dummy_handler);
-    printf("signal() retorno handler anterior: %p\n", old);
+    void *old = signal(12, dummy_handler);
+    printf("signal(12) retorno handler anterior: %p\n", old);
     fflush(stdout);
 
     // Intentar sobrescribir con sigaction()
@@ -30,18 +29,16 @@ int main() {
     sa.sa_handler = dummy_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
-    int ret = sigaction(10, &sa, NULL);
-    printf("sigaction() retorno: %d\n", ret);
+    int ret = sigaction(12, &sa, NULL);
+    printf("sigaction(12) retorno: %d\n", ret);
     fflush(stdout);
 
-    printf("Enviando SIGUSR1 a mi mismo...\n");
+    printf("Enviando SIGUSR2 a mi mismo...\n");
     fflush(stdout);
 
-    // Si nuestro hook funciona, esto deberia ejecutar stasis_freeze_trigger
-    // Si no funciona, ejecutaria dummy_handler
-    kill(getpid(), 10);
+    // Si nuestro hook funciona, se congela
+    kill(getpid(), 12);
 
-    // Si llegamos aqui, el handler NO funciono
     printf("ERROR: no se congelo!\n");
     return 1;
 }

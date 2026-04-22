@@ -1,15 +1,14 @@
 /*
- * test_kill_freeze_mt.c - Test freeze multithread via fork()
+ * test_freeze.c - Test basico de freeze con SIGUSR2
  *
- * Padre crea 3 threads, hijo envia SIGUSR2 tras 3s.
- * Todos los threads deberian congelarse.
+ * Uso:
+ *   LD_PRELOAD=./target/release/liblibstasis.so ./test_freeze_bin
+ *   Desde otra terminal: kill -12 <pid>
  */
 
 #include <unistd.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <pthread.h>
-#include <sys/wait.h>
+#include <stdio.h>
 
 void* thread_func(void* arg) {
     long id = (long)arg;
@@ -30,17 +29,6 @@ int main() {
     pthread_create(&t1, NULL, thread_func, (void*)1);
     pthread_create(&t2, NULL, thread_func, (void*)2);
     pthread_create(&t3, NULL, thread_func, (void*)3);
-
-    pid_t child = fork();
-    if (child == 0) {
-        sleep(3);
-        printf("[HIJO] Enviando SIGUSR2 al padre PID=%d\n", getppid());
-        kill(getppid(), 12);
-        sleep(5);
-        printf("[HIJO] Matando padre con kill -9\n");
-        kill(getppid(), 9);
-        _exit(0);
-    }
 
     while (1) {
         printf("Main corriendo...\n");

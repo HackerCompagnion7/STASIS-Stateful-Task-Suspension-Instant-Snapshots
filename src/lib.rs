@@ -1,15 +1,32 @@
 #![no_std] // Sin librería estándar para evitar dependencias ocultas
 
 use core::ffi::c_void;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 // ============================================================================
 // Constantes
 // ============================================================================
+//
+// SOLO usamos SIGUSR2 (senal 12).
+//
+// RAZON: En Android/Bionic, SIGUSR1 (senal 10) es usado internamente
+// por el runtime. Incluso si sigaction() retorna exito, el handler
+// no se respeta. SIGUSR2 es limpio y confiable en Bionic.
+//
+// Flujo:
+//   kill -12 <pid>  →  SIGUSR2 llega a un thread
+//   Ese thread es el "trigger": envía SIGUSR2 a todos los demas TIDs
+//   Los otros threads reciben SIGUSR2 y se congelan
+//   El trigger se congela al final
+//   Resultado: freeze global
+//
+// El guard FREEZE_BROADCAST_DONE evita que los threads que reciben
+// SIGUSR2 del broadcast intenten hacer otro broadcast (tormenta).
+// ============================================================================
 
 const RTLD_NEXT: *const c_void = -1isize as *const c_void;
 const MAX_THREADS: usize = 128;
-const SIGUSR1: i32 = 10; // Trigger: freeze all
-const SIGUSR2: i32 = 12; // Handler: freeze este thread
+const SIGUSR2: i32 = 12; // UNICA señal para freeze
 
 // ============================================================================
 // Tipos de función para los hooks
@@ -33,7 +50,7 @@ static mut REAL_WRITE: Option<FnWrite> = None;
 static mut REAL_PTHREAD_CREATE: Option<FnPthreadCreate> = None;
 static mut REAL_SIGACTION: Option<FnSigaction> = None;
 static mut REAL_SIGNAL: Option<FnSignal> = None;
-static mut IN_HOOK: bool = false;
+static IN_HOOK: AtomicBool = AtomicBool::new(false);
 
 // Thread tracking
 static mut SLOT_ROUTINES: [*const c_void; MAX_THREADS] = [core::ptr::null(); MAX_THREADS];
@@ -42,6 +59,9 @@ static mut SLOT_ACTIVE: [bool; MAX_THREADS] = [false; MAX_THREADS];
 static mut THREAD_TIDS: [i32; MAX_THREADS] = [0; MAX_THREADS];
 static mut THREAD_COUNT: usize = 0;
 static mut STASIS_PID: i32 = 0;
+
+// Guard: solo el PRIMER thread en recibir SIGUSR2 hace el broadcast
+static FREEZE_BROADCAST_DONE: AtomicBool = AtomicBool::new(false);
 
 // Flag: handlers instalados y listos
 static mut HANDLERS_INSTALLED: bool = false;
@@ -192,7 +212,7 @@ unsafe fn syscall4(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64) -> i64 {
 }
 
 // ============================================================================
-// Syscall helpers específicos por arquitectura
+// Syscall helpers por arquitectura
 // ============================================================================
 //
 // gettid:    x86_64=186, aarch64=178
@@ -242,19 +262,11 @@ unsafe fn raw_nanosleep() -> i32 {
 // Signal handler installation via libc sigaction()
 // ============================================================================
 //
-// Usamos libc's sigaction() para instalar handlers porque:
-//   1. Maneja sa_restorer automaticamente (requerido en x86_64)
-//   2. Traduce el layout interno correctamente
-//
-// PERo HOOKEamos sigaction() y signal() para que NADIE pueda
-// sobrescribir nuestros handlers de SIGUSR1/SIGUSR2.
-//
 // Layout por libc:
-//   - glibc:  sa_mask = 128 bytes (16 × u64)
-//   - Bionic: sa_mask = 8 bytes   (1 × u64)
+//   - glibc:  sa_mask = 128 bytes (16 x u64)
+//   - Bionic: sa_mask = 8 bytes   (1 x u64)
 // ============================================================================
 
-// glibc sigaction layout
 #[cfg(all(target_arch = "x86_64", target_env = "gnu"))]
 #[repr(C)]
 struct LibcSigaction {
@@ -265,7 +277,6 @@ struct LibcSigaction {
     sa_restorer: *const c_void,
 }
 
-// Bionic sigaction layout
 #[cfg(target_arch = "aarch64")]
 #[repr(C)]
 struct LibcSigaction {
@@ -276,7 +287,6 @@ struct LibcSigaction {
     sa_restorer: *const c_void,
 }
 
-// Fallback
 #[cfg(all(not(all(target_arch = "x86_64", target_env = "gnu")), not(target_arch = "aarch64")))]
 #[repr(C)]
 struct LibcSigaction {
@@ -289,7 +299,6 @@ struct LibcSigaction {
 
 const SA_RESTART: i32 = 0x10000000;
 
-// Instalar signal handler via REAL_SIGACTION (bypass nuestro hook)
 #[cfg(all(target_arch = "x86_64", target_env = "gnu"))]
 unsafe fn install_signal_handler(sig: i32, handler: *const c_void) -> i32 {
     let act = LibcSigaction {
@@ -301,10 +310,7 @@ unsafe fn install_signal_handler(sig: i32, handler: *const c_void) -> i32 {
     };
     match REAL_SIGACTION {
         Some(func) => func(sig, &act as *const _ as *const c_void, core::ptr::null_mut()),
-        None => {
-            log_raw(b"[STASIS FATAL] REAL_SIGACTION no disponible\n");
-            -1
-        }
+        None => -1,
     }
 }
 
@@ -319,10 +325,7 @@ unsafe fn install_signal_handler(sig: i32, handler: *const c_void) -> i32 {
     };
     match REAL_SIGACTION {
         Some(func) => func(sig, &act as *const _ as *const c_void, core::ptr::null_mut()),
-        None => {
-            log_raw(b"[STASIS FATAL] REAL_SIGACTION no disponible\n");
-            -1
-        }
+        None => -1,
     }
 }
 
@@ -353,10 +356,9 @@ unsafe fn verify_handler(sig: i32, expected: *const c_void) -> bool {
     }
 }
 
-// Reinstalar ambos handlers (usado como respaldo)
-unsafe fn reinstall_handlers() {
+// Reinstalar handler (respaldo)
+unsafe fn reinstall_handler() {
     install_signal_handler(SIGUSR2, stasis_freeze_handler as *const c_void);
-    install_signal_handler(SIGUSR1, stasis_freeze_trigger as *const c_void);
 }
 
 // ============================================================================
@@ -376,60 +378,47 @@ extern "C" {
 }
 
 // ============================================================================
-// Signal handlers
+// UNICO Signal handler: SIGUSR2 (senal 12)
 // ============================================================================
 //
-// Estos handlers se ejecutan en el stack del thread que recibe la señal.
-// Solo usan syscalls directas (raw_syscall_write, raw_nanosleep, raw_tgkill).
-// Cero libc, cero recursión, cero riesgo.
+// Cuando un thread recibe SIGUSR2:
+//   1. Si es el PRIMERO (FREEZE_BROADCAST_DONE == false):
+//      - Hace broadcast de SIGUSR2 a todos los otros TIDs
+//      - Marca FREEZE_BROADCAST_DONE = true
+//   2. Todos los threads (incluido el trigger) entran en nanosleep loop
+//      CPU cae a ~0%. Thread congelado.
+//
+// Este handler solo usa raw syscalls. Cero libc, cero recursion.
 // ============================================================================
 
-// SIGUSR2 (señal 12): congela ESTE thread
 #[unsafe(no_mangle)]
-unsafe extern "C" fn stasis_freeze_handler(sig: i32) {
-    if sig == SIGUSR2 {
-        log_raw(b"[STASIS FREEZE] SIGUSR2 - Thread congelado\n");
-    } else {
-        log_raw(b"[STASIS FREEZE] Signal desconocido - Thread congelado\n");
-    }
-    loop {
-        raw_nanosleep();
-    }
-}
+unsafe extern "C" fn stasis_freeze_handler(_sig: i32) {
+    log_raw(b"[STASIS] Signal recibida\n");
 
-// SIGUSR1 (señal 10): broadcast SIGUSR2 a TODOS los threads conocidos
-// Luego congela este thread también. Resultado: freeze global.
-#[unsafe(no_mangle)]
-unsafe extern "C" fn stasis_freeze_trigger(_: i32) {
-    log_raw(b"[STASIS] >>> FREEZE GLOBAL INICIADO <<<\n");
+    // Solo el primer thread hace el broadcast
+    if FREEZE_BROADCAST_DONE.compare_exchange(
+        false, true, Ordering::SeqCst, Ordering::SeqCst
+    ).is_ok() {
+        log_raw(b"[STASIS] >>> FREEZE GLOBAL INICIADO <<<\n");
 
-    let count = THREAD_COUNT;
-    let pid = STASIS_PID;
+        let count = THREAD_COUNT;
+        let pid = STASIS_PID;
+        let my_tid = raw_gettid();
 
-    if count == 0 {
-        log_raw(b"[STASIS WARN] No hay threads registrados\n");
-    } else if count <= 4 {
-        // Log simple para counts comunes
-        log_raw(b"[STASIS] Congelando threads\n");
-    } else {
-        log_raw(b"[STASIS] Congelando N threads\n");
-    }
-
-    for i in 0..count {
-        let tid = THREAD_TIDS[i];
-        if tid > 0 && tid != raw_gettid() {
-            let ret = raw_tgkill(pid, tid, SIGUSR2);
-            if ret != 0 {
-                log_raw(b"[STASIS WARN] tgkill fallo\n");
+        // Broadcast SIGUSR2 a todos los TIDs excepto este
+        for i in 0..count {
+            let tid = THREAD_TIDS[i];
+            if tid > 0 && tid != my_tid {
+                raw_tgkill(pid, tid, SIGUSR2);
             }
         }
+
+        // Pequena pausa para que los otros threads entren al handler
+        raw_nanosleep();
     }
 
-    // Pequeña pausa para que los otros threads entren al handler
-    raw_nanosleep();
-
-    // Congelar este thread también
-    log_raw(b"[STASIS FREEZE] Thread trigger congelado\n");
+    // Todos los threads: congelar
+    log_raw(b"[STASIS FREEZE] Thread congelado\n");
     loop {
         raw_nanosleep();
     }
@@ -443,10 +432,8 @@ extern "C" fn stasis_thread_wrapper(slot_idx_ptr: *mut c_void) -> *mut c_void {
     let slot_idx = slot_idx_ptr as usize;
 
     unsafe {
-        // Obtener TID del kernel
         let tid = raw_gettid();
 
-        // Almacenar TID
         if THREAD_COUNT < MAX_THREADS {
             THREAD_TIDS[THREAD_COUNT] = tid;
             THREAD_COUNT += 1;
@@ -454,12 +441,10 @@ extern "C" fn stasis_thread_wrapper(slot_idx_ptr: *mut c_void) -> *mut c_void {
 
         log_raw(b"[STASIS] Thread registrado (TID capturado)\n");
 
-        // Leer y liberar el slot
         let routine_ptr = SLOT_ROUTINES[slot_idx];
         let arg = SLOT_ARGS[slot_idx];
         SLOT_ACTIVE[slot_idx] = false;
 
-        // Llamar la start_routine original con el arg original
         if !routine_ptr.is_null() {
             let routine: extern "C" fn(*mut c_void) -> *mut c_void =
                 core::mem::transmute(routine_ptr);
@@ -476,17 +461,14 @@ extern "C" fn stasis_thread_wrapper(slot_idx_ptr: *mut c_void) -> *mut c_void {
 
 #[no_mangle]
 pub unsafe extern "C" fn stasis_init() {
-    // Obtener PID del proceso
     STASIS_PID = raw_getpid();
 
-    // Registrar TID del thread principal
     let main_tid = raw_gettid();
     THREAD_TIDS[0] = main_tid;
     THREAD_COUNT = 1;
 
     // Resolver funciones originales via dlsym
-    // IMPORTANTE: resolver sigaction ANTES de instalar handlers,
-    // porque nuestro hook de sigaction necesita REAL_SIGACTION
+    // IMPORTANTE: resolver sigaction ANTES de instalar handlers
 
     let real_sigaction_ptr = dlsym(RTLD_NEXT, b"sigaction\0".as_ptr());
     if real_sigaction_ptr.is_null() {
@@ -516,38 +498,30 @@ pub unsafe extern "C" fn stasis_init() {
         REAL_PTHREAD_CREATE = Some(core::mem::transmute(real_pthread_ptr));
     }
 
-    // Instalar signal handlers via REAL sigaction (bypass nuestro hook)
-    let ret2 = install_signal_handler(SIGUSR2, stasis_freeze_handler as *const c_void);
-    if ret2 != 0 {
+    // Instalar UNICO handler: SIGUSR2
+    let ret = install_signal_handler(SIGUSR2, stasis_freeze_handler as *const c_void);
+    if ret != 0 {
         log_raw(b"[STASIS FATAL] sigaction(SIGUSR2) fallo\n");
     } else {
         log_raw(b"[STASIS] Handler SIGUSR2 instalado OK\n");
     }
 
-    let ret1 = install_signal_handler(SIGUSR1, stasis_freeze_trigger as *const c_void);
-    if ret1 != 0 {
-        log_raw(b"[STASIS FATAL] sigaction(SIGUSR1) fallo\n");
+    // Verificar
+    if verify_handler(SIGUSR2, stasis_freeze_handler as *const c_void) {
+        log_raw(b"[STASIS] SIGUSR2 handler verificado OK\n");
     } else {
-        log_raw(b"[STASIS] Handler SIGUSR1 instalado OK\n");
-    }
-
-    // Verificar que los handlers quedaron instalados correctamente
-    if verify_handler(SIGUSR1, stasis_freeze_trigger as *const c_void) {
-        log_raw(b"[STASIS] SIGUSR1 handler verificado OK\n");
-    } else {
-        log_raw(b"[STASIS FATAL] SIGUSR1 handler no coincide - reintentando\n");
-        // Segundo intento
-        install_signal_handler(SIGUSR1, stasis_freeze_trigger as *const c_void);
-        if verify_handler(SIGUSR1, stasis_freeze_trigger as *const c_void) {
-            log_raw(b"[STASIS] SIGUSR1 handler reinstalado OK\n");
+        log_raw(b"[STASIS FATAL] SIGUSR2 handler no coincide - reintentando\n");
+        install_signal_handler(SIGUSR2, stasis_freeze_handler as *const c_void);
+        if verify_handler(SIGUSR2, stasis_freeze_handler as *const c_void) {
+            log_raw(b"[STASIS] SIGUSR2 handler reinstalado OK\n");
         } else {
-            log_raw(b"[STASIS FATAL] SIGUSR1 handler IMPOSIBLE de instalar\n");
+            log_raw(b"[STASIS FATAL] SIGUSR2 handler IMPOSIBLE de instalar\n");
         }
     }
 
     HANDLERS_INSTALLED = true;
 
-    log_raw(b"[STASIS] Hook activo. kill -10 <pid> = freeze all\n");
+    log_raw(b"[STASIS] Hook activo. kill -12 <pid> = freeze all\n");
 }
 
 #[link_section = ".init_array"]
@@ -560,10 +534,10 @@ static INIT_ARRAY: unsafe extern "C" fn() = stasis_init;
 
 #[no_mangle]
 pub unsafe extern "C" fn write(fd: i32, buf: *const c_void, count: usize) -> isize {
-    if fd == 1 && !IN_HOOK {
-        IN_HOOK = true;
+    if fd == 1 && !IN_HOOK.load(Ordering::Relaxed) {
+        IN_HOOK.store(true, Ordering::Relaxed);
         log_raw(b"[STASIS HOOK] Capturado write en stdout\n");
-        IN_HOOK = false;
+        IN_HOOK.store(false, Ordering::Relaxed);
     }
 
     match REAL_WRITE {
@@ -573,7 +547,7 @@ pub unsafe extern "C" fn write(fd: i32, buf: *const c_void, count: usize) -> isi
 }
 
 // ============================================================================
-// Hook: pthread_create - Registra threads + captura TIDs + reinstala handlers
+// Hook: pthread_create - Registra threads + captura TIDs + reinstala handler
 // ============================================================================
 
 #[no_mangle]
@@ -583,7 +557,6 @@ pub unsafe extern "C" fn pthread_create(
     start_routine: extern "C" fn(*mut c_void) -> *mut c_void,
     arg: *mut c_void,
 ) -> i32 {
-    // Buscar slot libre
     let mut slot_idx: usize = MAX_THREADS;
     for i in 0..MAX_THREADS {
         if !SLOT_ACTIVE[i] {
@@ -600,12 +573,10 @@ pub unsafe extern "C" fn pthread_create(
         };
     }
 
-    // Guardar routine y arg en el slot
     SLOT_ROUTINES[slot_idx] = start_routine as *const c_void;
     SLOT_ARGS[slot_idx] = arg;
     SLOT_ACTIVE[slot_idx] = true;
 
-    // Llamar pthread_create REAL con nuestro wrapper
     let result = match REAL_PTHREAD_CREATE {
         Some(func) => func(
             thread,
@@ -620,23 +591,16 @@ pub unsafe extern "C" fn pthread_create(
         }
     };
 
-    // RESPALDO: Reinstalar handlers despues de cada pthread_create
-    // En Bionic/Android, pthread_create puede sobrescribir signal handlers
+    // RESPALDO: Reinstalar handler despues de cada pthread_create
     if HANDLERS_INSTALLED {
-        reinstall_handlers();
+        reinstall_handler();
     }
 
     result
 }
 
 // ============================================================================
-// Hook: sigaction - Protege SIGUSR1 y SIGUSR2 contra sobrescritura
-// ============================================================================
-//
-// Si alguien intenta cambiar el handler de SIGUSR1 o SIGUSR2,
-// retornamos éxito (0) pero NO hacemos el cambio realmente.
-// Si piden oldact, les damos el handler real que está instalado.
-// Para otras señales, pasamos al sigaction real normalmente.
+// Hook: sigaction - Protege SIGUSR2 contra sobrescritura
 // ============================================================================
 
 #[no_mangle]
@@ -645,9 +609,7 @@ pub unsafe extern "C" fn sigaction(
     act: *const c_void,
     oldact: *mut c_void,
 ) -> i32 {
-    // Proteger nuestras señales
-    if sig == SIGUSR1 || sig == SIGUSR2 {
-        // Si piden el oldact, darles nuestro handler real
+    if sig == SIGUSR2 {
         if !oldact.is_null() {
             match REAL_SIGACTION {
                 Some(func) => {
@@ -656,15 +618,12 @@ pub unsafe extern "C" fn sigaction(
                 None => {}
             }
         }
-        // Si hay act (intentan instalar un handler), lo ignoramos
-        // Retornamos 0 (éxito) para que el llamador no se queje
         if !act.is_null() {
-            log_raw(b"[STASIS GUARD] sigaction blocked on protected signal\n");
+            log_raw(b"[STASIS GUARD] sigaction blocked on SIGUSR2\n");
         }
         return 0;
     }
 
-    // Para otras señales, pasar al sigaction real
     match REAL_SIGACTION {
         Some(func) => func(sig, act, oldact),
         None => -1,
@@ -672,11 +631,7 @@ pub unsafe extern "C" fn sigaction(
 }
 
 // ============================================================================
-// Hook: signal - Protege SIGUSR1 y SIGUSR2 contra sobrescritura
-// ============================================================================
-//
-// Igual que sigaction: si alguien intenta signal(SIGUSR1, ...) o
-// signal(SIGUSR2, ...), retornamos el handler anterior pero NO cambiamos nada.
+// Hook: signal - Protege SIGUSR2 contra sobrescritura
 // ============================================================================
 
 #[no_mangle]
@@ -684,10 +639,7 @@ pub unsafe extern "C" fn signal(
     sig: i32,
     handler: *const c_void,
 ) -> *const c_void {
-    // Proteger nuestras señales
-    if sig == SIGUSR1 || sig == SIGUSR2 {
-        // Retornar el handler que está realmente instalado
-        // (para que el llamador crea que todo está bien)
+    if sig == SIGUSR2 {
         let mut old_act: LibcSigaction = core::mem::zeroed();
         match REAL_SIGACTION {
             Some(func) => {
@@ -695,11 +647,10 @@ pub unsafe extern "C" fn signal(
             }
             None => {}
         }
-        log_raw(b"[STASIS GUARD] signal() blocked on protected signal\n");
+        log_raw(b"[STASIS GUARD] signal() blocked on SIGUSR2\n");
         return old_act.sa_handler;
     }
 
-    // Para otras señales, pasar al signal real
     match REAL_SIGNAL {
         Some(func) => func(sig, handler),
         None => core::ptr::null(),
