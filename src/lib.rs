@@ -233,46 +233,95 @@ unsafe fn raw_nanosleep() -> i32 {
 }
 
 // ============================================================================
-// Signal handler installation via glibc sigaction
+// Signal handler installation via libc sigaction()
 // ============================================================================
 //
-// glibc's sigaction() traduce los layouts internamente y maneja
-// sa_restorer automaticamente. Mas fiable que el raw syscall para
-// la instalacion del handler.
+// PROBLEMA ORIGINAL: Usabamos un struct GlibcSigaction con sa_mask de 128 bytes
+// (layout glibc). En Bionic, sa_mask es solo 8 bytes → offsets equivocados
+// → sigaction() lee basura → handler NO se instala.
 //
-// Layout de glibc sigaction en x86_64/aarch64:
-//   sa_handler:  union (8 bytes)
-//   sa_mask:     sigset_t (128 bytes)
-//   sa_flags:    i32 (4 bytes + 4 padding)
-//   sa_restorer: *const c_void (8 bytes, solo x86_64)
+// SOLUCION: Usar el struct correcto para cada libc via #[cfg(target_env)]:
+//   - glibc (Linux desktop):  sigset_t = 128 bytes (16 × u64)
+//   - Bionic (Android/Termux): sigset_t = 8 bytes (1 × u64)
+//
+// El handler mismo solo usa raw syscalls (zero libc). Pero para INSTALAR
+// el handler, usamos libc's sigaction() porque:
+//   1. Maneja sa_restorer automaticamente (requerido en x86_64)
+//   2. Traduce el layout interno correctamente
+//   3. Funciona en glibc, Bionic, musl
 // ============================================================================
 
+// glibc sigaction layout
+#[cfg(all(target_arch = "x86_64", target_env = "gnu"))]
 #[repr(C)]
-struct GlibcSigaction {
+struct LibcSigaction {
     sa_handler: *const c_void,
-    sa_mask: [u64; 16], // 128 bytes, glibc sigset_t
+    sa_mask: [u64; 16], // glibc sigset_t = 128 bytes
     sa_flags: i32,
-    #[cfg(target_arch = "x86_64")]
-    _pad: i32,          // padding antes de sa_restorer
-    #[cfg(target_arch = "x86_64")]
+    _pad: i32,
+    sa_restorer: *const c_void,
+}
+
+// Bionic sigaction layout (aarch64 Android/Termux)
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+struct LibcSigaction {
+    sa_handler: *const c_void,
+    sa_mask: [u64; 1],  // Bionic sigset_t = 8 bytes (unsigned long)
+    sa_flags: i32,
+    _pad: i32,
+    sa_restorer: *const c_void,
+}
+
+// Fallback para otros entornos (musl, etc)
+#[cfg(all(not(all(target_arch = "x86_64", target_env = "gnu")), not(target_arch = "aarch64")))]
+#[repr(C)]
+struct LibcSigaction {
+    sa_handler: *const c_void,
+    sa_mask: [u64; 16], // default: asumir glibc-size
+    sa_flags: i32,
+    _pad: i32,
     sa_restorer: *const c_void,
 }
 
 const SA_RESTART: i32 = 0x10000000;
 
 extern "C" {
-    fn sigaction(sig: i32, act: *const GlibcSigaction, oldact: *mut GlibcSigaction) -> i32;
+    fn sigaction(sig: i32, act: *const LibcSigaction, oldact: *mut LibcSigaction) -> i32;
 }
 
+#[cfg(all(target_arch = "x86_64", target_env = "gnu"))]
 unsafe fn install_signal_handler(sig: i32, handler: *const c_void) -> i32 {
-    let act = GlibcSigaction {
+    let act = LibcSigaction {
         sa_handler: handler,
         sa_mask: [0; 16],
         sa_flags: SA_RESTART,
-        #[cfg(target_arch = "x86_64")]
         _pad: 0,
-        #[cfg(target_arch = "x86_64")]
-        sa_restorer: core::ptr::null(), // glibc lo rellena automaticamente
+        sa_restorer: core::ptr::null(),
+    };
+    sigaction(sig, &act, core::ptr::null_mut())
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn install_signal_handler(sig: i32, handler: *const c_void) -> i32 {
+    let act = LibcSigaction {
+        sa_handler: handler,
+        sa_mask: [0; 1],
+        sa_flags: SA_RESTART,
+        _pad: 0,
+        sa_restorer: core::ptr::null(),
+    };
+    sigaction(sig, &act, core::ptr::null_mut())
+}
+
+#[cfg(all(not(all(target_arch = "x86_64", target_env = "gnu")), not(target_arch = "aarch64")))]
+unsafe fn install_signal_handler(sig: i32, handler: *const c_void) -> i32 {
+    let act = LibcSigaction {
+        sa_handler: handler,
+        sa_mask: [0; 16],
+        sa_flags: SA_RESTART,
+        _pad: 0,
+        sa_restorer: core::ptr::null(),
     };
     sigaction(sig, &act, core::ptr::null_mut())
 }
@@ -429,17 +478,35 @@ pub unsafe extern "C" fn stasis_init() {
         REAL_PTHREAD_CREATE = Some(core::mem::transmute(real_pthread_ptr));
     }
 
-    // Instalar signal handlers via glibc sigaction
-    // SIGUSR2: congela el thread que lo recibe
+    // Instalar signal handlers via libc sigaction()
+    // (struct correcto por arquitectura: glibc=128bytes, Bionic=8bytes)
+    //
+    // SIGUSR2 (senal 12): congela el thread que lo recibe
     let ret2 = install_signal_handler(SIGUSR2, stasis_freeze_handler as *const c_void);
     if ret2 != 0 {
-        log_raw(b"[STASIS WARN] sigaction(SIGUSR2) fallo\n");
+        log_raw(b"[STASIS FATAL] sigaction(SIGUSR2) fallo\n");
+    } else {
+        log_raw(b"[STASIS] Handler SIGUSR2 instalado OK\n");
     }
 
-    // SIGUSR1: broadcast SIGUSR2 a todos los threads (freeze global)
+    // SIGUSR1 (senal 10): broadcast SIGUSR2 a todos los threads (freeze global)
     let ret1 = install_signal_handler(SIGUSR1, stasis_freeze_trigger as *const c_void);
     if ret1 != 0 {
-        log_raw(b"[STASIS WARN] sigaction(SIGUSR1) fallo\n");
+        log_raw(b"[STASIS FATAL] sigaction(SIGUSR1) fallo\n");
+    } else {
+        log_raw(b"[STASIS] Handler SIGUSR1 instalado OK\n");
+    }
+
+    // Verificar que el handler SIGUSR1 quedó instalado correctamente
+    // (leer de vuelta con sigaction(oldact) y comparar punteros)
+    let mut old_act: LibcSigaction = core::mem::zeroed();
+    sigaction(SIGUSR1, core::ptr::null(), &mut old_act);
+    if old_act.sa_handler == stasis_freeze_trigger as *const c_void {
+        log_raw(b"[STASIS] SIGUSR1 handler verificado OK\n");
+    } else if old_act.sa_handler.is_null() {
+        log_raw(b"[STASIS FATAL] SIGUSR1 handler es NULL!\n");
+    } else {
+        log_raw(b"[STASIS FATAL] SIGUSR1 handler no coincide!\n");
     }
 
     log_raw(b"[STASIS] Hook activo. kill -10 <pid> = freeze all\n");
